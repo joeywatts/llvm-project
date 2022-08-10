@@ -84,6 +84,10 @@ AST_MATCHER(DeclRefExpr, hasExplicitTemplateArgs) {
 
 const auto DefaultContainersWithPushBack =
     "::std::vector; ::std::list; ::std::deque";
+const auto DefaultContainersWithPush =
+    "::std::stack; ::std::queue; ::std::priority_queue";
+const auto DefaultContainersWithPushFront =
+    "::std::forward_list; ::std::list; ::std::deque";
 const auto DefaultSmartPointers =
     "::std::shared_ptr; ::std::unique_ptr; ::std::auto_ptr; ::std::weak_ptr";
 const auto DefaultTupleTypes = "::std::pair; ::std::tuple";
@@ -109,6 +113,10 @@ UseEmplaceCheck::UseEmplaceCheck(StringRef Name, ClangTidyContext *Context)
                                          "IgnoreImplicitConstructors", false)),
       ContainersWithPushBack(utils::options::parseStringList(Options.get(
           "ContainersWithPushBack", DefaultContainersWithPushBack))),
+      ContainersWithPush(utils::options::parseStringList(
+          Options.get("ContainersWithPush", DefaultContainersWithPush))),
+      ContainersWithPushFront(utils::options::parseStringList(Options.get(
+          "ContainersWithPushFront", DefaultContainersWithPushFront))),
       SmartPointers(utils::options::parseStringList(
           Options.get("SmartPointers", DefaultSmartPointers))),
       TupleTypes(utils::options::parseStringList(
@@ -120,9 +128,6 @@ UseEmplaceCheck::UseEmplaceCheck(StringRef Name, ClangTidyContext *Context)
 
 void UseEmplaceCheck::registerMatchers(MatchFinder *Finder) {
   // FIXME: Bunch of functionality that could be easily added:
-  // + add handling of `push_front` for std::forward_list, std::list
-  // and std::deque.
-  // + add handling of `push` for std::stack, std::queue, std::priority_queue
   // + add handling of `insert` for stl associative container, but be careful
   // because this requires special treatment (it could cause performance
   // regression)
@@ -130,6 +135,14 @@ void UseEmplaceCheck::registerMatchers(MatchFinder *Finder) {
   auto CallPushBack = cxxMemberCallExpr(
       hasDeclaration(functionDecl(hasName("push_back"))),
       on(hasType(cxxRecordDecl(hasAnyName(ContainersWithPushBack)))));
+
+  auto CallPush = cxxMemberCallExpr(
+      hasDeclaration(functionDecl(hasName("push"))),
+      on(hasType(cxxRecordDecl(hasAnyName(ContainersWithPush)))));
+
+  auto CallPushFront = cxxMemberCallExpr(
+      hasDeclaration(functionDecl(hasName("push_front"))),
+      on(hasType(cxxRecordDecl(hasAnyName(ContainersWithPushFront)))));
 
   auto CallEmplacy = cxxMemberCallExpr(
       hasDeclaration(
@@ -209,6 +222,18 @@ void UseEmplaceCheck::registerMatchers(MatchFinder *Finder) {
       this);
 
   Finder->addMatcher(
+      traverse(TK_AsIs, cxxMemberCallExpr(CallPush, has(SoughtParam),
+                                          unless(isInTemplateInstantiation()))
+                            .bind("push_call")),
+      this);
+
+  Finder->addMatcher(
+      traverse(TK_AsIs, cxxMemberCallExpr(CallPushFront, has(SoughtParam),
+                                          unless(isInTemplateInstantiation()))
+                            .bind("push_front_call")),
+      this);
+
+  Finder->addMatcher(
       traverse(TK_AsIs,
                cxxMemberCallExpr(
                    CallEmplacy, HasConstructExprWithValueTypeTypeAsLastArgument,
@@ -237,15 +262,29 @@ void UseEmplaceCheck::registerMatchers(MatchFinder *Finder) {
 void UseEmplaceCheck::check(const MatchFinder::MatchResult &Result) {
   const auto *PushBackCall =
       Result.Nodes.getNodeAs<CXXMemberCallExpr>("push_back_call");
+  const auto *PushCall = Result.Nodes.getNodeAs<CXXMemberCallExpr>("push_call");
+  const auto *PushFrontCall =
+      Result.Nodes.getNodeAs<CXXMemberCallExpr>("push_front_call");
   const auto *EmplacyCall =
       Result.Nodes.getNodeAs<CXXMemberCallExpr>("emplacy_call");
   const auto *CtorCall = Result.Nodes.getNodeAs<CXXConstructExpr>("ctor");
   const auto *MakeCall = Result.Nodes.getNodeAs<CallExpr>("make");
 
-  assert((PushBackCall || EmplacyCall) && "No call matched");
-  assert((CtorCall || MakeCall) && "No push_back parameter matched");
+  const CXXMemberCallExpr *Call = [&]() {
+    if (PushBackCall) {
+      return PushBackCall;
+    }
+    if (PushCall) {
+      return PushCall;
+    }
+    if (PushFrontCall) {
+      return PushFrontCall;
+    }
+    return EmplacyCall;
+  }();
 
-  const CXXMemberCallExpr *Call = PushBackCall ? PushBackCall : EmplacyCall;
+  assert(Call && "No call matched");
+  assert((CtorCall || MakeCall) && "No push_back parameter matched");
 
   if (IgnoreImplicitConstructors && CtorCall && CtorCall->getNumArgs() >= 1 &&
       CtorCall->getArg(0)->getSourceRange() == CtorCall->getSourceRange())
@@ -254,18 +293,37 @@ void UseEmplaceCheck::check(const MatchFinder::MatchResult &Result) {
   const auto FunctionNameSourceRange = CharSourceRange::getCharRange(
       Call->getExprLoc(), Call->getArg(0)->getExprLoc());
 
-  auto Diag =
-      PushBackCall
-          ? diag(Call->getExprLoc(), "use emplace_back instead of push_back")
-          : diag(CtorCall ? CtorCall->getBeginLoc() : MakeCall->getBeginLoc(),
-                 "unnecessary temporary object created while calling " +
-                     Call->getMethodDecl()->getName().str());
+  auto Diag = [&]() {
+    if (PushBackCall) {
+      return diag(Call->getExprLoc(), "use emplace_back instead of push_back");
+    }
+    if (PushCall) {
+      return diag(Call->getExprLoc(), "use emplace instead of push");
+    }
+    if (PushFrontCall) {
+      return diag(Call->getExprLoc(),
+                  "use emplace_front instead of push_front");
+    }
+    return diag(CtorCall ? CtorCall->getBeginLoc() : MakeCall->getBeginLoc(),
+                "unnecessary temporary object created while calling " +
+                    Call->getMethodDecl()->getName().str());
+  }();
 
   if (FunctionNameSourceRange.getBegin().isMacroID())
     return;
 
   if (PushBackCall) {
     const char *EmplacePrefix = MakeCall ? "emplace_back" : "emplace_back(";
+    Diag << FixItHint::CreateReplacement(FunctionNameSourceRange,
+                                         EmplacePrefix);
+  }
+  if (PushCall) {
+    const char *EmplacePrefix = MakeCall ? "emplace" : "emplace(";
+    Diag << FixItHint::CreateReplacement(FunctionNameSourceRange,
+                                         EmplacePrefix);
+  }
+  if (PushFrontCall) {
+    const char *EmplacePrefix = MakeCall ? "emplace_front" : "emplace_front(";
     Diag << FixItHint::CreateReplacement(FunctionNameSourceRange,
                                          EmplacePrefix);
   }
@@ -302,6 +360,10 @@ void UseEmplaceCheck::storeOptions(ClangTidyOptions::OptionMap &Opts) {
   Options.store(Opts, "IgnoreImplicitConstructors", IgnoreImplicitConstructors);
   Options.store(Opts, "ContainersWithPushBack",
                 utils::options::serializeStringList(ContainersWithPushBack));
+  Options.store(Opts, "ContainersWithPush",
+                utils::options::serializeStringList(ContainersWithPush));
+  Options.store(Opts, "ContainersWithPushFront",
+                utils::options::serializeStringList(ContainersWithPushFront));
   Options.store(Opts, "SmartPointers",
                 utils::options::serializeStringList(SmartPointers));
   Options.store(Opts, "TupleTypes",

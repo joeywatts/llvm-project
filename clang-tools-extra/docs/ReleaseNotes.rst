@@ -105,6 +105,12 @@ New check aliases
 Changes in existing checks
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+- Improved `modernize-use-emplace <clang-tidy/checks/modernize/use-emplace.html>`_ check.
+
+  The check now supports detecting inefficient invocations of ``push`` and
+  ``push_front`` on STL-style containers and replacing them with ``emplace``
+  or ``emplace_front``.
+
 Removed checks
 ^^^^^^^^^^^^^^
 
